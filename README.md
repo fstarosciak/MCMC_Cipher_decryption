@@ -1,8 +1,5 @@
 # Dekrypcja szyfrów klasycznych metodą MCMC
 
-**Projekt:** Modelowanie Monte Carlo — Temat nr 13
-**Autorzy:** Michał Czajkowski, Filip Starościak
-
 ---
 
 ## Opis
