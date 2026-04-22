@@ -36,7 +36,7 @@ TRANSPOSITION_RESTARTS = 10    # restartów (MH szybko utyka w lokalnym maksimum
 
 # ─── Parametry ────────────────────────────────────────────────────────────────
 
-TEXT_LENGTHS = [100, 500, 1000, 5000]   # długości tekstu do eksperymentów [litery]
+TEXT_LENGTHS = [100, 500, 1000, 5000, 10000]   # długości tekstu do eksperymentów [litery]
 N_RUNS      = 100                        # liczba powtórzeń Monte Carlo
 N_ITER      = 10_000                     # iteracji MH na jeden przebieg
 SEED        = 42

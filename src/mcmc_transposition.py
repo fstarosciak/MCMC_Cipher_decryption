@@ -1,16 +1,5 @@
 """
-Łamanie szyfru kolumnowego metodą Metropolis-Hastings (MCMC).
-
-Przestrzeń stanów: permutacje długości k (k! możliwości — przy k=10 to 3.6·10^6,
-więc MH daje realny zysk względem brute force już od k ≈ 8).
-Rozkład docelowy: pi(key) ∝ exp(score(key)), gdzie score = suma log-bigramów
-                  na zdekodowanym tekście.
-Propozycja: zamiana dwóch losowych pozycji w kluczu (symetryczna -> kryterium Metropolisa).
-
-KISS: na każdej iteracji przeliczamy pełny score zdekodowanego tekstu.
-W odróżnieniu od szyfru podstawieniowego, swap pozycji w kluczu przestawia
-CAŁE dwie kolumny, więc „sprytna delta" z mcmc_solver.py nie daje łatwego zysku.
-Dla n ~ 1000 i n_iter ~ 10^4 pełne przeliczanie zajmuje sekundy.
+Łamanie szyfru kolumnowego przez MCMC (Parallel Tempering).
 """
 
 from __future__ import annotations
@@ -20,70 +9,134 @@ from .transposition import decrypt
 
 
 def _score(decoded: np.ndarray, log_bigrams: np.ndarray) -> float:
-    """Suma log-prawdopodobieństw bigramów w zdekodowanym tekście."""
+    # Sumujemy logarytmy prawdopodobieństw występowania par liter obok siebie
     return float(log_bigrams[decoded[:-1], decoded[1:]].sum())
+
+
+def _propose(key: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    # Losowa modyfikacja klucza: swap, odwrócenie fragmentu albo przesunięcie elementu
+    k = len(key)
+    new_key = key.copy()
+    u = rng.random()
+
+    if u < 0.7 or k < 4:
+        # Zamiana dwóch kolumn
+        i, j = rng.choice(k, 2, replace=False)
+        new_key[i], new_key[j] = new_key[j], new_key[i]
+    elif u < 0.9:
+        # Odwrócenie kolejności w losowym bloku
+        i, j = sorted(rng.choice(k, 2, replace=False))
+        new_key[i:j + 1] = new_key[i:j + 1][::-1]
+    else:
+        # Wycięcie jednej kolumny i wsadzenie jej w inne miejsce
+        i, j = rng.choice(k, 2, replace=False)
+        val = new_key[i]
+        new_key = np.delete(new_key, i)
+        new_key = np.insert(new_key, j if j < i else j - 1, val)
+
+    return new_key.astype(np.int8)
+
+
+def parallel_tempering(
+    ciphertext: np.ndarray,
+    log_bigrams: np.ndarray,
+    key_length: int,
+    n_iter: int = 20_000,
+    n_chains: int = 6,
+    t_min: float = 0.4,
+    t_max: float = 6.0,
+    swap_every: int = 40,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, float, list[float]]:
+    # Kilka łańcuchów w różnych temperaturach. Zimne szukają lokalnie, gorące skaczą po całym rozwiązaniu.
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # Rozkład temperatur (skala geometryczna)
+    temperatures = t_min * (t_max / t_min) ** (
+        np.arange(n_chains) / max(n_chains - 1, 1)
+    )
+
+    keys = [rng.permutation(key_length).astype(np.int8) for _ in range(n_chains)]
+    scores = [_score(decrypt(ciphertext, k), log_bigrams) for k in keys]
+
+    best_key = keys[0].copy()
+    best_score = scores[0]
+    best_history = [best_score]
+
+    for step in range(n_iter):
+        for c in range(n_chains):
+            # Standardowy krok Metropolis-Hastings dla każdego łańcucha
+            proposed = _propose(keys[c], rng)
+            new_score = _score(decrypt(ciphertext, proposed), log_bigrams)
+            delta = (new_score - scores[c]) / temperatures[c]
+            
+            if np.log(rng.random()) < delta:
+                keys[c] = proposed
+                scores[c] = new_score
+                if new_score > best_score:
+                    best_score = new_score
+                    best_key = proposed.copy()
+                    best_history.append(best_score)
+
+        # Co jakiś czas próbujemy zamienić stany między sąsiednimi łańcuchami
+        if step % swap_every == 0 and step > 0:
+            for c in range(n_chains - 1):
+                log_alpha = (scores[c] - scores[c + 1]) * (
+                    1.0 / temperatures[c + 1] - 1.0 / temperatures[c]
+                )
+                if np.log(rng.random()) < log_alpha:
+                    keys[c], keys[c + 1] = keys[c + 1], keys[c]
+                    scores[c], scores[c + 1] = scores[c + 1], scores[c]
+
+    return best_key, best_score, best_history
 
 
 def metropolis_hastings_transposition(
     ciphertext: np.ndarray,
     log_bigrams: np.ndarray,
     key_length: int,
-    n_iter: int = 10_000,
+    n_iter: int = 20_000,
     initial_key: np.ndarray | None = None,
+    t_start: float = 3.0,
+    t_end: float = 0.05,
+    rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, float, list[float]]:
-    """
-    Metropolis-Hastings dla szyfru kolumnowego przy znanej długości klucza.
-
-    W każdej iteracji:
-      1. Proponuje swap dwóch losowych pozycji w kluczu.
-      2. Deszyfruje ciphertext bieżącym kluczem i liczy score bigramowy.
-      3. Akceptuje swap z prawdopodobieństwem min(1, exp(delta)).
-      4. Zapamiętuje najlepszy dotąd klucz.
-
-    Args:
-        ciphertext:  tablica indeksów 0-25; długość musi dzielić się przez key_length
-        log_bigrams: macierz 26×26 log-prawdopodobieństw bigramów
-        key_length:  długość klucza (liczba kolumn)
-        n_iter:      liczba iteracji MH
-        initial_key: startowy klucz (losowy, jeśli None)
-
-    Returns:
-        (best_key, best_score, score_history) — analogicznie do mcmc_solver.py
-    """
+    # Prostsza wersja algorytmu z jednym łańcuchem i stopniowym chłodzeniem
     if len(ciphertext) % key_length != 0:
-        raise ValueError(
-            f"Długość ciphertextu ({len(ciphertext)}) nie dzieli się przez "
-            f"key_length ({key_length})."
-        )
+        raise ValueError("Długość tekstu nie pasuje do długości klucza.")
+    
+    if rng is None:
+        rng = np.random.default_rng()
 
     key = (
         initial_key.copy().astype(np.int8)
         if initial_key is not None
-        else np.random.permutation(key_length).astype(np.int8)
+        else rng.permutation(key_length).astype(np.int8)
     )
     current_score = _score(decrypt(ciphertext, key), log_bigrams)
     best_key = key.copy()
     best_score = current_score
     score_history = [current_score]
 
-    log_rand = np.log(np.random.rand(n_iter))
+    cooling = (t_end / t_start) ** (1.0 / max(n_iter - 1, 1))
+    temperature = t_start
+    log_rand = np.log(rng.random(n_iter))
 
     for step in range(n_iter):
-        i, j = np.random.choice(key_length, 2, replace=False)
-        key[i], key[j] = key[j], key[i]
-
-        new_score = _score(decrypt(ciphertext, key), log_bigrams)
-        delta = new_score - current_score
+        proposed = _propose(key, rng)
+        new_score = _score(decrypt(ciphertext, proposed), log_bigrams)
+        delta = (new_score - current_score) / temperature
 
         if log_rand[step] < delta:
+            key = proposed
             current_score = new_score
             if current_score > best_score:
                 best_score = current_score
                 best_key = key.copy()
                 score_history.append(best_score)
-        else:
-            # odrzuć — wróć do poprzedniego klucza
-            key[i], key[j] = key[j], key[i]
+
+        temperature *= cooling
 
     return best_key, best_score, score_history
 
@@ -92,25 +145,28 @@ def solve_transposition(
     ciphertext: np.ndarray,
     log_bigrams: np.ndarray,
     key_length: int,
-    n_iter: int = 10_000,
-    n_restarts: int = 10,
+    n_iter: int | None = None,
+    n_restarts: int | None = None,
+    seed: int | None = None,
 ) -> tuple[np.ndarray, float, list[float]]:
-    """
-    MH z wieloma restartami (multi-start). Przy transpozycji delta score'u
-    przy swapie kolumn bywa rzędu setek, więc zwykłe MH szybko utyka w lokalnym
-    maksimum (efektywnie hill-climbing). Restart z losowego punktu to prosty
-    i skuteczny sposób na pokonanie tego problemu.
+    # Główny punkt wejścia - odpala PT kilka razy i wybiera najlepszy wynik ze wszystkich prób
+    if n_iter is None:
+        n_iter = max(6_000, 1_500 * key_length)
+    if n_restarts is None:
+        n_restarts = max(3, key_length // 2)
 
-    Zwraca wynik restartu o najwyższym score'ze oraz jego score_history
-    (wygodne do wykresu zbieżności „najlepszego przebiegu").
-    """
-    best_key = None
+    rng = np.random.default_rng(seed)
+    best_key: np.ndarray | None = None
     best_score = -np.inf
     best_history: list[float] = []
+
     for _ in range(n_restarts):
-        key, score, history = metropolis_hastings_transposition(
-            ciphertext, log_bigrams, key_length, n_iter=n_iter
+        key, score, history = parallel_tempering(
+            ciphertext, log_bigrams, key_length,
+            n_iter=n_iter, rng=rng,
         )
         if score > best_score:
             best_key, best_score, best_history = key, score, history
+
+    assert best_key is not None
     return best_key, best_score, best_history
