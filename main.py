@@ -3,7 +3,7 @@ Główny skrypt projektu: Łamanie szyfru podstawieniowego metodą MCMC.
 Projekt: Modelowanie Monte Carlo — Temat nr 13
 Autorzy: Michał Czajkowski, Filip Starościak
 Schemat działania:
- 1. Pobierz korpus „Pan Tadeusz" (Project Gutenberg) i zbuduj macierz bigramów.
+ 1. Pobierz korpus „lalka" (Project Gutenberg) i zbuduj macierz bigramów.
  2. Demonstracja — jeden pełny cykl: szyfrowanie → MH → weryfikacja.
  3. Eksperymenty Monte Carlo — N=100 prób dla długości tekstu [100, 500, 1000, 5000]:
     a) szyfr podstawieniowy (monoalfabetyczny)
