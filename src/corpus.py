@@ -13,12 +13,16 @@ import urllib.request
 import string
 import numpy as np
 
-# Dwa tomy „Lalki" z Wolnych Lektur. Łączymy w jeden strumień tekstu,
-# co daje mocniejsze statystyki bigramów.
-CORPUS_SOURCES = [
-    ("lalka_tom_pierwszy.txt", "https://wolnelektury.pl/media/book/txt/lalka-tom-pierwszy.txt"),
-    ("lalka_tom_drugi.txt",    "https://wolnelektury.pl/media/book/txt/lalka-tom-drugi.txt"),
-]
+# Dostępne korpusy: Lalka (Prus) oraz Quo Vadis (Sienkiewicz).
+CORPUS_SOURCES = {
+    "lalka": [
+        ("lalka_tom_pierwszy.txt", "https://wolnelektury.pl/media/book/txt/lalka-tom-pierwszy.txt"),
+        ("lalka_tom_drugi.txt",    "https://wolnelektury.pl/media/book/txt/lalka-tom-drugi.txt"),
+    ],
+    "quo_vadis": [
+        ("quo_vadis.txt", "https://wolnelektury.pl/media/book/txt/quo-vadis.txt"),
+    ]
+}
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(_HERE, "data")
@@ -30,14 +34,17 @@ LETTER_TO_IDX = {c: i for i, c in enumerate(ALPHABET)}
 _POLISH_MAP = str.maketrans("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ", "acelnoszzACELNOSZZ")
 
 
-def download_corpus() -> list[str]:
+def download_corpus(name: str = "lalka") -> list[str]:
     """Pobiera pliki korpusu z Wolnych Lektur, jeśli nie są jeszcze na dysku."""
     os.makedirs(DATA_DIR, exist_ok=True)
     paths = []
-    for filename, url in CORPUS_SOURCES:
+    if name not in CORPUS_SOURCES:
+        raise ValueError(f"Nieznany korpus: {name}. Dostępne: {list(CORPUS_SOURCES.keys())}")
+        
+    for filename, url in CORPUS_SOURCES[name]:
         path = os.path.join(DATA_DIR, filename)
         if not os.path.exists(path):
-            print(f"Pobieranie korpusu:\n  {url}")
+            print(f"Pobieranie korpusu ({name}):\n  {url}")
             try:
                 urllib.request.urlretrieve(url, path)
                 print(f"  -> {path}")
@@ -93,15 +100,26 @@ def build_bigram_matrix(letter_indices: np.ndarray, smoothing: float = 1.0) -> n
     return np.log(counts / row_sums)
 
 
-def prepare_bigram_matrix() -> tuple[np.ndarray, np.ndarray]:
+def prepare_bigram_matrix(name: str = "lalka", test_split: float = 0.1) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Pobiera korpus (jeśli trzeba), przetwarza go i zwraca:
-      - macierz log-bigramów (26×26)
-      - pełny tekst jako tablica indeksów liter
+    Pobiera korpus, przetwarza go i zwraca:
+      - macierz log-bigramów (zbudowaną z części treningowej)
+      - tekst treningowy (jako tablica indeksów)
+      - tekst testowy (jako tablica indeksów, wycięty z końca korpusu)
     """
-    corpus_files = download_corpus()
+    corpus_files = download_corpus(name)
     text = load_corpus(corpus_files)
     letter_indices = text_to_indices(text)
-    print(f"Korpus załadowany: {len(letter_indices):,} liter")
-    log_bigrams = build_bigram_matrix(letter_indices)
-    return log_bigrams, letter_indices
+    
+    # Podział na train/test, żeby tekst do deszyfracji nie był tym samym,
+    # na którym liczyliśmy bigramy (realistyczny scenariusz).
+    split_idx = int(len(letter_indices) * (1 - test_split))
+    train_text = letter_indices[:split_idx]
+    test_text  = letter_indices[split_idx:]
+    
+    print(f"Korpus '{name}' załadowany: {len(letter_indices):,} liter")
+    print(f"  Trening: {len(train_text):,} liter, Test: {len(test_text):,} liter")
+    
+    log_bigrams = build_bigram_matrix(train_text)
+    return log_bigrams, train_text, test_text
+
