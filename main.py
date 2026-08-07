@@ -1,207 +1,186 @@
-"""
-Główny skrypt projektu: Łamanie szyfru podstawieniowego metodą MCMC.
-Projekt: Modelowanie Monte Carlo — Temat nr 13
-Autorzy: Michał Czajkowski, Filip Starościak
-Schemat działania:
- 1. Pobierz korpus „lalka" (Project Gutenberg) i zbuduj macierz bigramów.
- 2. Demonstracja — jeden pełny cykl: szyfrowanie → MH → weryfikacja.
- 3. Eksperymenty Monte Carlo — N=100 prób dla długości tekstu [100, 500, 1000, 5000]:
-    a) szyfr podstawieniowy (monoalfabetyczny)
-    b) szyfr kolumnowy (transpozycyjny)
- 4. Wykresy: zbieżność MH, histogram dokładności, boxplot vs długość,
-    porównanie obu szyfrów.
-"""
 import numpy as np
-import string
-from src.corpus import prepare_bigram_matrix
+import argparse
+
+from src.corpus import prepare_bigram_matrix, CORPUS_SOURCES
 from src.cipher import inverse_key, encrypt, decrypt, key_accuracy, indices_to_str
 from src.mcmc_solver import metropolis_hastings
 from src import transposition
 from src.mcmc_transposition import solve_transposition
 from src.experiments import (
-    run_monte_carlo,
-    run_monte_carlo_transposition,
-    print_results,
     plot_convergence,
-    plot_accuracy_histogram,
-    plot_accuracy_vs_length,
-    plot_mean_accuracy_vs_length,
-    plot_comparison_accuracy_vs_length,
-    plot_comparison_boxplot,
+    run_monte_carlo_transposition,
+    print_results_transposition,
+    plot_accuracy_histogram_transposition,
+    plot_accuracy_vs_keylength,
+    plot_mean_accuracy_vs_keylength,
 )
 
-# ─── Parametry szyfru przestawieniowego ──────────────────────────────────────
-TRANSPOSITION_KEY_LEN = 8   # długość klucza (liczba kolumn)
-TRANSPOSITION_TEXT_LEN = 1000  # długość tekstu w demo
-TRANSPOSITION_N_ITER = 10_000  # iteracji MH na jeden restart
-TRANSPOSITION_RESTARTS = 10    # restartów (MH szybko utyka w lokalnym maksimum)
-
-# ─── Parametry ────────────────────────────────────────────────────────────────
-TEXT_LENGTHS = [100, 500, 1000, 5000]  # długości tekstu do eksperymentów [litery]
-N_RUNS = 100        # liczba powtórzeń Monte Carlo
-N_ITER = 10_000     # iteracji MH na jeden przebieg
+COMMON_N_ITER = 30_000
 SEED = 42
 
-# ──────────────────────────────────────────────────────────────────────────────
+TRANS_DEMO_KEY_LEN = 8
+TRANS_DEMO_TEXT_LEN = 2000
+TRANS_DEMO_RESTARTS = 8
+
+KEY_LENGTHS = [3, 5, 8, 10]
+TRANS_TEXT_LEN = 2500
+TRANS_N_RUNS = 20
+TRANS_N_ITER = 25_000
+TRANS_N_RESTARTS = 8
+
+POC_TEXT_LEN = 500
 
 
-def demo(full_text: np.ndarray, log_bigrams: np.ndarray) -> list[float]:
-    """
-    Demonstracja jednego pełnego cyklu szyfrowania i deszyfrowania (500 liter).
-    Wypisuje próbkę oryginału i odszyfowanego tekstu.
-    """
+def print_tui_preview(title, original, encrypted, decrypted, sample_len=300):
+    width = 100
+    print(f"\n{'╔' + '═'*(width-2) + '╗'}")
+    print(f"║ {title.center(width-4)} ║")
+    print(f"{'╠' + '═'*(width-2) + '╣'}")
+
+    def print_block(label, data):
+        text = indices_to_str(data[:sample_len])
+        print(f"║ [{label}]".ljust(width-1) + "║")
+        for i in range(0, len(text), width - 6):
+            line = text[i:i+width-6]
+            print(f"║   {line.ljust(width-6)} ║")
+        print(f"║{' '.ljust(width-2)}║")
+
+    print_block("TEKST ORYGINALNY", original)
+    print_block("SZYFROGRAM (WEJŚCIE)", encrypted)
+    print_block("WYNIK DESZYFRACJI (NAJLEPSZY ZNALEZIONY)", decrypted)
+    print(f"{'╚' + '═'*(width-2) + '╝'}")
+
+
+def demo_transposition(test_text, log_bigrams):
     print("\n" + "=" * 60)
-    print(" DEMONSTRACJA — jeden przebieg MH (500 liter, 10 000 iter.)")
-    print("=" * 60)
-
-    rng = np.random.default_rng(SEED)
-    plaintext = full_text[:500]
-    true_decrypt_key = rng.permutation(26).astype("int8")
-    true_encrypt_key = inverse_key(true_decrypt_key)
-    ciphertext = encrypt(plaintext, true_encrypt_key)
-
-    found_key, best_score, score_history = metropolis_hastings(
-        ciphertext, log_bigrams, n_iter=N_ITER
-    )
-
-    accuracy = key_accuracy(true_decrypt_key, found_key)
-    print(f"  Dokładność klucza : {accuracy:.1%} ({int(accuracy * 26)}/26 liter)")
-    print(f"  Najlepszy score   : {best_score:.2f}")
-
-    recovered = decrypt(ciphertext, found_key)
-    sample = 100
-    print(f"\n  Oryginał (pierwsze {sample} liter): {indices_to_str(plaintext[:sample])}")
-    print(f"  Odszyfr. (pierwsze {sample} liter): {indices_to_str(recovered[:sample])}")
-    n_match = np.sum(recovered[:sample] == plaintext[:sample])
-    print(f"  Trafne litery w próbce: {n_match}/{sample}")
-
-    return score_history
-
-
-def demo_transposition(full_text: np.ndarray, log_bigrams: np.ndarray) -> list[float]:
-    """
-    Demonstracja łamania szyfru kolumnowego (transpozycyjnego) metodą MH.
-    Szyfrujemy fragment korpusu znanym kluczem, potem MH próbuje go odtworzyć.
-    """
-    print("\n" + "=" * 60)
-    print(f" DEMONSTRACJA — szyfr kolumnowy "
-          f"(k={TRANSPOSITION_KEY_LEN}, {TRANSPOSITION_TEXT_LEN} liter, "
-          f"{TRANSPOSITION_N_ITER} iter × {TRANSPOSITION_RESTARTS} restartów)")
+    print(f"  DEMONSTRACJA — szyfr kolumnowy"
+          f"  (k={TRANS_DEMO_KEY_LEN}, {TRANS_DEMO_TEXT_LEN} liter,"
+          f"  {COMMON_N_ITER} iter × {TRANS_DEMO_RESTARTS} restartów)")
     print("=" * 60)
 
     rng = np.random.default_rng(SEED + 1)
-    k = TRANSPOSITION_KEY_LEN
+    k = TRANS_DEMO_KEY_LEN
+    length = (TRANS_DEMO_TEXT_LEN // k) * k
 
-    # Tekst przycinamy do wielokrotności k, żeby demo było deterministyczne
-    length = (TRANSPOSITION_TEXT_LEN // k) * k
-    plaintext = full_text[:length]
+    start_idx = rng.integers(0, len(test_text) - length)
+    plaintext = test_text[start_idx : start_idx + length]
 
     true_key = rng.permutation(k).astype(np.int8)
     ciphertext = transposition.encrypt(plaintext, true_key)
 
+    print(f"\n[!] SZYFROGRAM (fragment): {indices_to_str(ciphertext[:100])}...")
+    print("[*] Rozpoczynam deszyfrowanie MCMC (Parallel Tempering)...")
+
     found_key, best_score, score_history = solve_transposition(
         ciphertext, log_bigrams,
         key_length=k,
-        n_iter=TRANSPOSITION_N_ITER,
-        n_restarts=TRANSPOSITION_RESTARTS,
+        n_iter=COMMON_N_ITER,
+        n_restarts=TRANS_DEMO_RESTARTS,
     )
 
     recovered = transposition.decrypt(ciphertext, found_key)
     acc_key = transposition.key_accuracy(true_key, found_key)
     acc_text = transposition.text_accuracy(plaintext, recovered)
 
-    print(f"  Prawdziwy klucz   : {true_key.tolist()}")
+    print(f"\n  Prawdziwy klucz   : {true_key.tolist()}")
     print(f"  Znaleziony klucz  : {found_key.tolist()}")
-    print(f"  Dokładność klucza : {acc_key:.1%} ({int(acc_key * k)}/{k} pozycji)")
+    print(f"  Dokładność klucza : {acc_key:.1%}  ({int(acc_key * k)}/{k} pozycji)")
     print(f"  Zgodność liter    : {acc_text:.1%}")
     print(f"  Najlepszy score   : {best_score:.2f}")
 
-    sample = 100
-    print(f"\n  Oryginał (pierwsze {sample}): {indices_to_str(plaintext[:sample])}")
-    print(f"  Odszyfr. (pierwsze {sample}): {indices_to_str(recovered[:sample])}")
-    n_match = int(np.sum(recovered[:sample] == plaintext[:sample]))
-    print(f"  Trafne litery w próbce: {n_match}/{sample}")
+    print_tui_preview("WYNIK KOŃCOWY: SZYFR PRZESTAWIENIOWY", plaintext, ciphertext, recovered)
 
     return score_history
 
 
-def main() -> None:
+def poc_substitution(test_text, log_bigrams):
+    print("\n" + "=" * 60)
+    print(f"  PoC — szyfr podstawieniowy  ({POC_TEXT_LEN} liter, {COMMON_N_ITER} iter.)")
+    print("=" * 60)
+
+    rng = np.random.default_rng(SEED)
+
+    start_idx = rng.integers(0, len(test_text) - POC_TEXT_LEN)
+    plaintext = test_text[start_idx : start_idx + POC_TEXT_LEN]
+
+    true_decrypt_key = rng.permutation(26).astype("int8")
+    true_encrypt_key = inverse_key(true_decrypt_key)
+    ciphertext = encrypt(plaintext, true_encrypt_key)
+
+    print(f"\n[!] SZYFROGRAM (fragment): {indices_to_str(ciphertext[:100])}...")
+    print("[*] Rozpoczynam deszyfrowanie MCMC (Metropolis-Hastings)...")
+
+    found_key, best_score, score_history = metropolis_hastings(
+        ciphertext, log_bigrams, n_iter=COMMON_N_ITER
+    )
+    accuracy = key_accuracy(true_decrypt_key, found_key)
+
+    print(f"\n  Dokładność klucza : {accuracy:.1%}  ({int(accuracy * 26)}/26 liter)")
+    print(f"  Najlepszy score   : {best_score:.2f}")
+
+    recovered = decrypt(ciphertext, found_key)
+    print_tui_preview("WYNIK KOŃCOWY: SZYFR PODSTAWIENIOWY", plaintext, ciphertext, recovered)
+
+    return score_history
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MCMC Cipher Decryption")
+    parser.add_argument("--corpus", type=str, default="lalka", choices=list(CORPUS_SOURCES.keys()),
+                        help="Wybierz korpus do nauki bigramów")
+    args = parser.parse_args()
+
     np.random.seed(SEED)
 
-    # 1. Korpus i macierz bigramów
-    print("Przygotowanie macierzy bigramów z korpusu...")
-    log_bigrams, full_text = prepare_bigram_matrix()
-    print(f"Macierz bigramów: {log_bigrams.shape}, min={log_bigrams.min():.2f}, "
-          f"max={log_bigrams.max():.2f}")
+    print(f"Przygotowanie macierzy bigramów z korpusu: {args.corpus}...")
+    log_bigrams, train_text, test_text = prepare_bigram_matrix(name=args.corpus)
 
-    # 2. Demonstracja — szyfr podstawieniowy
-    demo_history = demo(full_text, log_bigrams)
-    plot_convergence([demo_history], title="demo_500liter")
+    print("\n" + "=" * 60)
+    print(f"  EKSPERYMENTY MONTE CARLO — szyfr przestawieniowy")
+    print(f"  N_RUNS={TRANS_N_RUNS}, N_ITER={TRANS_N_ITER}, "
+          f"N_RESTARTS={TRANS_N_RESTARTS}, klucze={KEY_LENGTHS}")
+    print("=" * 60)
 
-    # 2b. Demonstracja — szyfr kolumnowy (transpozycyjny)
-    trans_history = demo_transposition(full_text, log_bigrams)
+    all_trans_results = []
+    for k in KEY_LENGTHS:
+        results = run_monte_carlo_transposition(
+            test_text, log_bigrams,
+            key_length=k,
+            text_length=TRANS_TEXT_LEN,
+            n_runs=TRANS_N_RUNS,
+            n_iter=TRANS_N_ITER,
+            n_restarts=TRANS_N_RESTARTS,
+        )
+        print_results_transposition(results)
+        all_trans_results.append(results)
+
+        plot_accuracy_histogram_transposition(results)
+        plot_convergence(
+            results["score_histories"][:10],
+            title=f"trans_{args.corpus}_k{k}",
+        )
+
+    plot_accuracy_vs_keylength(all_trans_results)
+    plot_mean_accuracy_vs_keylength(all_trans_results)
+
+    print("\n" + "=" * 60)
+    print("  DEMONSTRACJA: SZYFR PRZESTAWIENIOWY")
+    print("  (Wizualizacja najlepszego wyniku po wszystkich iteracjach)")
+    print("=" * 60)
+
+    trans_demo_history = demo_transposition(test_text, log_bigrams)
     plot_convergence(
-        [trans_history],
-        title=f"transposition_k{TRANSPOSITION_KEY_LEN}_{TRANSPOSITION_TEXT_LEN}liter",
+        [trans_demo_history],
+        title=f"trans_demo_{args.corpus}_k{TRANS_DEMO_KEY_LEN}",
     )
 
-    # 3a. Eksperymenty Monte Carlo — szyfr podstawieniowy
     print("\n" + "=" * 60)
-    print(f" EKSPERYMENTY MONTE CARLO — szyfr podstawieniowy")
-    print(f" N_RUNS={N_RUNS}, N_ITER={N_ITER}, długości={TEXT_LENGTHS}")
+    print("  PUNKT ODNIESIENIA: SZYFR PODSTAWIENIOWY")
+    print(f"  Używamy tej samej liczby iteracji: {COMMON_N_ITER}")
     print("=" * 60)
 
-    subst_results = []
-    for length in TEXT_LENGTHS:
-        results = run_monte_carlo(
-            full_text, log_bigrams,
-            text_length=length,
-            n_runs=N_RUNS,
-            n_iter=N_ITER,
-        )
-        print_results(results)
-        subst_results.append(results)
-        plot_accuracy_histogram(results)
-        plot_convergence(
-            results["score_histories"][:10],
-            title=f"{length}liter",
-        )
-
-    # 3b. Eksperymenty Monte Carlo — szyfr kolumnowy
-    print("\n" + "=" * 60)
-    print(f" EKSPERYMENTY MONTE CARLO — szyfr kolumnowy")
-    print(f" N_RUNS={N_RUNS}, N_ITER={N_ITER}, k={TRANSPOSITION_KEY_LEN}, "
-          f"restartów={TRANSPOSITION_RESTARTS}, długości={TEXT_LENGTHS}")
-    print("=" * 60)
-
-    trans_results = []
-    for length in TEXT_LENGTHS:
-        results = run_monte_carlo_transposition(
-            full_text, log_bigrams,
-            key_length=TRANSPOSITION_KEY_LEN,
-            text_length=length,
-            n_runs=N_RUNS,
-            n_iter=N_ITER,
-            n_restarts=TRANSPOSITION_RESTARTS,
-        )
-        print_results(results)
-        trans_results.append(results)
-        plot_accuracy_histogram(results)
-        plot_convergence(
-            results["score_histories"][:10],
-            title=f"transp_k{TRANSPOSITION_KEY_LEN}_{length}liter",
-        )
-
-    # 4. Wykresy zbiorcze — podstawieniowy
-    plot_accuracy_vs_length(subst_results)
-    plot_mean_accuracy_vs_length(subst_results)
-
-    # 5. Wykresy porównawcze — oba szyfry
-    print("\n" + "=" * 60)
-    print(" WYKRESY PORÓWNAWCZE")
-    print("=" * 60)
-    plot_comparison_accuracy_vs_length(subst_results, trans_results)
-    plot_comparison_boxplot(subst_results, trans_results)
+    poc_history = poc_substitution(test_text, log_bigrams)
+    plot_convergence([poc_history], title=f"poc_substitution_{args.corpus}")
 
     print("\nGotowe! Wyniki i wykresy zapisano w katalogu results/")
 

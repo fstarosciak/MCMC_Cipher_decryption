@@ -1,14 +1,3 @@
-"""
-Szyfr kolumnowy (columnar transposition).
-
-Klucz to permutacja liczb 0..k-1 określająca kolejność odczytu kolumn.
-Plaintext wpisujemy wierszami do macierzy o k kolumnach, w razie potrzeby
-dopełniamy literą indeksu 0 ('A'), a ciphertext powstaje przez odczyt
-kolumn w kolejności podanej kluczem.
-
-Deszyfrowanie odbywa się przez permutację odwrotną (argsort).
-"""
-
 from __future__ import annotations
 import numpy as np
 
@@ -37,8 +26,7 @@ def decrypt(ciphertext: np.ndarray, key: np.ndarray) -> np.ndarray:
     k = len(key)
     if len(ciphertext) % k != 0:
         raise ValueError(
-            f"Długość ciphertextu ({len(ciphertext)}) nie dzieli się przez "
-            f"len(key)={k}."
+            f"Długość ciphertextu ({len(ciphertext)}) nie dzieli się przez len(key)={k}."
         )
     rows = len(ciphertext) // k
     inv = np.argsort(key)
